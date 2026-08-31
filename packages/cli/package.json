@@ -1,0 +1,51 @@
+{
+  "name": "bridle-cli",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./home": "./dist/src/home.js",
+    "./client": "./dist/src/client.js",
+    "./actions": "./dist/src/actions.js"
+  },
+  "bin": {
+    "bridle": "./dist/src/bin.js"
+  },
+  "dependencies": {
+    "bridle-core": "^0.1.0"
+  },
+  "description": "Bridle CLI \u2014 hand work to a teammate's agent, under their policy.",
+  "keywords": [
+    "bridle",
+    "agents",
+    "cli",
+    "handoff",
+    "ai"
+  ],
+  "homepage": "https://github.com/ShapeStudio/bridle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShapeStudio/bridle.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/ShapeStudio/bridle/issues"
+  },
+  "author": "Shape (https://shape-labs.com)",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,447 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  readIdentity, readPolicy, readConfig, writeConfig, up, isUp, readPending, paths,
+  bridleHome, workspaceRoot, defaultNodeName, adoptLegacyNode, localNodes,
+  readOutbox, readReceived,
+} from "./home.js";
+import { api, device, DEFAULT_COORD } from "./client.js";
+import { send, peek, collect, decide, grant, revoke, report, buildContext, fileToAttachment, summarise, fingerprint } from "./actions.js";
+import type { Verb } from "bridle-core";
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const rest = argv.slice(1);
+
+const flag = (n: string): string | undefined => {
+  const i = rest.indexOf(`--${n}`);
+  return i >= 0 ? rest[i + 1] : undefined;
+};
+const has = (n: string) => rest.includes(`--${n}`);
+const positional = rest.filter((a, i) => !a.startsWith("--") && !(i > 0 && rest[i - 1]?.startsWith("--")));
+
+const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+const tone = (v: string) =>
+  v === "allow" ? `\x1b[32m${v}\x1b[0m` : v === "ask" ? `\x1b[33m${v}\x1b[0m` : `\x1b[31m${v}\x1b[0m`;
+
+const HELP = `
+${bold("bridle")} — hand work to a teammate's agent, under their policy.
+
+  bridle up [--name <you>]                     enable this workspace and authorise it
+                                               (one node per repo, not per machine)
+  bridle up --offline                          keys + policy only, join later
+  bridle join --coord <url> --invite <code>    join a bridlenet
+  bridle share [--name <them>]                 everything a teammate needs, in one paste
+  bridle invite                                just the raw invite code
+  bridle peers                                 who else is on this bridlenet
+  bridle grant <peer> --repo <r> --verbs a,b   let a peer send you specific things
+  bridle revoke <peer>                         withdraw a grant
+
+  bridle send <peer> --note "..." [--file f] [--decision "..."] [--repo r]
+  bridle queue <peer> --title "..." [--detail "..."] [--repo r]
+  bridle state <peer> --fields branch,diffstat
+  bridle ask <peer> --command "pnpm test"
+
+  bridle work                                  what you have been handed
+  bridle done <id> [--note "..."]              tell the sender it is finished
+  bridle working <id> | bridle blocked <id>    tell them where it got to
+  bridle tasks                                 what you handed out, and what came back
+
+  bridle inbox                                 look at what is waiting, change nothing
+  bridle inbox --collect [--deliver]           take delivery: evaluate and acknowledge
+  bridle pending                               work held for your approval
+  bridle approve <id> | bridle deny <id>       the second key
+  bridle access                                who you have opened this node to
+  bridle nodes                                 every node on this machine
+  bridle status | bridle policy | bridle audit
+`;
+
+async function main(): Promise<void> {
+  switch (cmd) {
+    case "up": {
+      const moved = adoptLegacyNode();
+      if (moved) console.log(dim(`moved your existing node into ${moved.to}`));
+      const name = flag("name") ?? readConfigName() ?? defaultNodeName();
+      const { identity, created } = up(name);
+      console.log(created ? `${bold("bridle is up")} as ${identity.name}` : `already up as ${identity.name}`);
+      console.log(`  fingerprint  ${fingerprint(identity.publicKey)}`);
+      console.log(`  workspace    ${workspaceRoot()}`);
+      console.log(`  home         ${bridleHome()}`);
+
+      if (readConfig().token) {
+        console.log(`  bridlenet    ${readConfig().coord}`);
+        return;
+      }
+      if (has("offline")) {
+        console.log(dim("\nNothing can reach this node until you join a bridlenet and grant a scope."));
+        return;
+      }
+
+      // No credential yet: authorise this device in a browser. `bridle join`
+      // with an invite code remains the path for self-hosted coordination.
+      const coord = flag("coord") ?? DEFAULT_COORD;
+      const req = await device.start(coord, {
+        name: identity.name,
+        key: identity.publicKey,
+        sealKey: identity.sealPublicKey,
+      });
+      console.log(`\n  To authorise this node, open:\n    ${bold(req.verificationUri)}`);
+      console.log(`  and enter the code:\n    ${bold(req.userCode)}\n`);
+      openBrowser(`${req.verificationUri}?code=${encodeURIComponent(req.userCode)}`);
+      process.stdout.write(dim("  waiting for approval"));
+
+      const deadline = Date.now() + req.expiresIn * 1000;
+      for (;;) {
+        if (Date.now() > deadline) throw new Error("timed out waiting for approval");
+        await sleep(req.interval * 1000);
+        const r = await device.poll(coord, req.deviceCode);
+        if (r.status === "approved") {
+          writeConfig({ coord, token: r.token });
+          process.stdout.write("\n");
+          console.log(`\n${bold("authorised")} as ${r.name}`);
+          console.log(dim("Peers still cannot send you anything until you grant them a scope."));
+          console.log(`\nBring in a teammate:  ${bold("bridle share")}`);
+          return;
+        }
+        process.stdout.write(dim("."));
+      }
+    }
+
+    case "join": {
+      const coord = flag("coord");
+      const invite = flag("invite");
+      const name = flag("name");
+      if (!coord || !invite) throw new Error("--coord and --invite are required");
+      if (!isUp()) {
+        if (!name) throw new Error("--name is required (this node is not up yet)");
+        up(name);
+      }
+      const identity = readIdentity();
+      const { token } = await api.register(coord, {
+        name: identity.name,
+        key: identity.publicKey,
+        sealKey: identity.sealPublicKey,
+        invite,
+      });
+      writeConfig({ coord, token });
+      console.log(`${bold("joined")} ${coord} as ${identity.name}`);
+      console.log(dim("Peers still cannot send you anything until you `bridle grant` them."));
+      return;
+    }
+
+    case "invite": {
+      const { code } = await api.invite();
+      console.log(code);
+      console.log(dim("Hand this to one teammate. It works once. `bridle share` prints the full instructions."));
+      return;
+    }
+
+    // Everything a teammate needs, in one paste. Minting the invite here rather
+    // than during `up` means codes exist only when somebody actually asks to
+    // share — an unused invite is a credential lying around.
+    case "share": {
+      const identity = readIdentity();
+      const cfg = readConfig();
+      if (!cfg.coord) throw new Error("join a bridlenet first — run `bridle up`");
+      const { code } = await api.invite();
+      const them = flag("name") ?? "<their-name>";
+
+      console.log(`\n${bold("Send this to one teammate.")} The invite works once.\n`);
+      console.log(dim("────────────────────────────────────────────────────────"));
+      console.log(`You're joining ${bold(readPolicy().node)}'s bridlenet on Bridle.\n`);
+      console.log("1. Install");
+      console.log(dim("   npm install -g bridle-cli\n"));
+      console.log("2. Join");
+      console.log(dim(`   bridle join --coord ${cfg.coord} --invite ${code} --name ${them}\n`));
+      console.log("3. Hand me something");
+      console.log(dim(`   bridle send ${identity.name} --note "..."`));
+      console.log(dim(`   bridle queue ${identity.name} --title "..."\n`));
+      console.log(dim("   `bridle peers` shows who else is on the mesh."));
+      console.log(dim("────────────────────────────────────────────────────────"));
+      console.log(`\nThen, on your side once they have joined:`);
+      console.log(`   ${bold(`bridle grant ${them} --verbs context.push,task.queue`)}`);
+      console.log(dim("Nothing they send arrives until you do. That is the point.\n"));
+      return;
+    }
+
+    case "peers": {
+      const { peers } = await api.peers();
+      const policy = readPolicy();
+      for (const p of peers) {
+        const g = policy.peers[p.name];
+        const state = g ? `granted ${g.verbs?.join(",") || "—"}` : dim("no grant");
+        console.log(`${p.name.padEnd(18)} ${dim(fingerprint(p.key))}  ${state}`);
+      }
+      return;
+    }
+
+    case "grant": {
+      const peer = positional[0];
+      if (!peer) throw new Error("usage: bridle grant <peer> --repo <r> --verbs a,b");
+      const verbs = flag("verbs")?.split(",").map((v) => v.trim() as Verb);
+      const repos = flag("repo")?.split(",").map((r) => r.trim());
+      await grant(peer, { repos, verbs });
+      const g = readPolicy().peers[peer]!;
+      console.log(`granted ${bold(peer)} → verbs [${g.verbs?.join(", ")}] repos [${g.repos?.join(", ") || "any"}]`);
+      return;
+    }
+
+    case "revoke": {
+      const peer = positional[0];
+      if (!peer) throw new Error("usage: bridle revoke <peer>");
+      revoke(peer);
+      console.log(`revoked ${peer}`);
+      return;
+    }
+
+    case "send": {
+      const to = positional[0];
+      if (!to) throw new Error("usage: bridle send <peer> --note ...");
+      const files = flag("file") ? [fileToAttachment(flag("file")!)] : undefined;
+      const { id } = await send({
+        to,
+        verb: "context.push",
+        repo: flag("repo"),
+        payload: buildContext({
+          note: flag("note"),
+          decision: flag("decision"),
+          files,
+          links: flag("link") ? [flag("link")!] : undefined,
+        }),
+      });
+      console.log(`sent ${dim(id.slice(0, 8))} → ${to}`);
+      return;
+    }
+
+    case "queue": {
+      const to = positional[0];
+      if (!to) throw new Error("usage: bridle queue <peer> --title ...");
+      const title = flag("title");
+      if (!title) throw new Error("--title is required");
+      const { id } = await send({
+        to, verb: "task.queue", repo: flag("repo"),
+        payload: { title, detail: flag("detail"), repo: flag("repo") },
+      });
+      console.log(`queued ${dim(id.slice(0, 8))} → ${to}`);
+      return;
+    }
+
+    case "state": {
+      const to = positional[0];
+      const fields = (flag("fields") ?? "branch,diffstat").split(",") as ("branch" | "diffstat" | "openFiles" | "task")[];
+      if (!to) throw new Error("usage: bridle state <peer> --fields branch,diffstat");
+      const { id } = await send({ to, verb: "state.read", repo: flag("repo"), payload: { fields } });
+      console.log(`asked ${dim(id.slice(0, 8))} → ${to}`);
+      return;
+    }
+
+    case "ask": {
+      const to = positional[0];
+      const command = flag("command");
+      if (!to || !command) throw new Error('usage: bridle ask <peer> --command "pnpm test"');
+      const { id } = await send({
+        to, verb: "run.request", repo: flag("repo"),
+        payload: { command, cwd: flag("cwd"), reason: flag("reason") },
+      });
+      console.log(`requested ${dim(id.slice(0, 8))} → ${to}`);
+      console.log(dim("run.request stops at their approval by default."));
+      return;
+    }
+
+    case "inbox": {
+      // Looking is not taking. --collect (or --deliver) is what acknowledges.
+      const taking = has("collect") || has("deliver");
+      const results = taking ? await collect() : await peek();
+      if (!results.length) {
+        console.log(dim("nothing waiting"));
+        return;
+      }
+      for (const r of results) {
+        const { envelope: e, decision: d } = r;
+        console.log(`${tone(d.verdict).padEnd(16)} ${bold(e.verb)}  ${dim(e.id.slice(0, 8))}  from ${e.from}`);
+        if (e.payload) console.log(`  ${summarise(e)}`);
+        for (const reason of d.reasons) {
+          if (reason.verdict !== "allow" || d.verdict === "allow") console.log(dim(`  · ${reason.detail}`));
+        }
+        if (d.verdict === "ask" && taking) console.log(dim(`  → bridle approve ${e.id.slice(0, 8)}`));
+        if (r.rendered && has("deliver")) console.log("\n" + r.rendered + "\n");
+      }
+      if (!taking) {
+        console.log(dim(`\nnothing was collected — this was a look. run \`bridle inbox --collect\` to take delivery.`));
+      }
+      return;
+    }
+
+    // Report back on work someone handed you. The sender sees it against the
+    // thing they asked for, so a handoff stops being fire-and-forget.
+    case "done":
+    case "working":
+    case "blocked": {
+      const id = positional[0];
+      if (!id) throw new Error(`usage: bridle ${cmd} <id> [--note "..."]`);
+      const r = await report(id, cmd, flag("note"));
+      console.log(`${tone(cmd === "blocked" ? "deny" : cmd === "done" ? "allow" : "ask")} ${bold(cmd)} → ${r.to}`);
+      console.log(dim(`  about: ${r.about}`));
+      return;
+    }
+
+    /** What this node has been handed and can report on. */
+    case "work": {
+      const inbound = Object.values(readReceived()).sort((a, b) => b.at.localeCompare(a.at));
+      if (!inbound.length) { console.log(dim("nothing has been handed to this node yet")); return; }
+      for (const w of inbound) {
+        console.log(`${dim(w.id.slice(0, 8))}  ${bold(w.verb)}  from ${w.from}`);
+        console.log(`  ${w.summary}`);
+        console.log(dim(`  → bridle done ${w.id.slice(0, 8)} --note "..."`));
+      }
+      return;
+    }
+
+    /** What this node handed out, and what came back. */
+    case "tasks": {
+      const out = Object.values(readOutbox()).sort((a, b) => b.sentAt.localeCompare(a.sentAt));
+      if (!out.length) { console.log(dim("you have not handed anything over yet")); return; }
+      for (const t of out) {
+        const state = t.status
+          ? tone(t.status === "done" ? "allow" : t.status === "blocked" ? "deny" : "ask")
+          : dim("no word yet");
+        console.log(`${dim(t.id.slice(0, 8))}  ${t.to.padEnd(26)} ${state}`);
+        console.log(`  ${t.summary}`);
+        if (t.note) console.log(dim(`  “${t.note}”`));
+      }
+      return;
+    }
+
+    case "pending": {
+      const held = readPending();
+      if (!held.length) { console.log(dim("nothing held")); return; }
+      for (const h of held) {
+        console.log(`${tone("ask").padEnd(16)} ${bold(h.envelope.verb)}  ${dim(h.envelope.id.slice(0, 8))}  from ${h.envelope.from}`);
+        console.log(`  ${summarise(h.envelope)}`);
+        for (const r of h.decision.reasons) console.log(dim(`  · ${r.detail}`));
+      }
+      return;
+    }
+
+    case "approve":
+    case "deny": {
+      const id = positional[0];
+      if (!id) throw new Error(`usage: bridle ${cmd} <id>`);
+      const r = await decide(id, cmd === "approve" ? "allow" : "deny");
+      console.log(`${tone(cmd === "approve" ? "allow" : "deny")} ${r.envelope.verb} from ${r.envelope.from}`);
+      if (r.rendered) console.log("\n" + r.rendered + "\n");
+      return;
+    }
+
+    case "status": {
+      if (!isUp()) {
+        console.log("bridle is not up here. Run `bridle up --name <you>`.");
+        return;
+      }
+      const identity = readIdentity();
+      const policy = readPolicy();
+      const cfg = readConfig();
+      const pending = readPending();
+      console.log(`${bold(identity.name)}  ${dim(fingerprint(identity.publicKey))}`);
+      console.log(`  workspace   ${workspaceRoot()}`);
+      console.log(`  bridlenet   ${cfg.coord ?? dim("not joined")}`);
+      console.log(`  grants      ${Object.keys(policy.peers).length}`);
+      console.log(`  pending     ${pending.length}`);
+      for (const [name, g] of Object.entries(policy.peers)) {
+        console.log(`    ${name.padEnd(16)} ${g.verbs?.join(", ")}  ${dim((g.repos ?? []).join(", ") || "any repo")}`);
+      }
+      return;
+    }
+
+    /**
+     * Everything this node has opened up, in one place. Grants are held by the
+     * receiver, so this is the only place the whole picture exists — the
+     * coordination server never sees a policy.
+     */
+    case "access": {
+      const policy = readPolicy();
+      const identity = readIdentity();
+      const outbox = Object.values(readOutbox());
+
+      console.log(`${bold(identity.name)} ${dim("— what this node has opened up")}\n`);
+
+      const peers = Object.entries(policy.peers);
+      console.log(`${bold("Granted")} ${dim("· who may send this node what")}`);
+      if (!peers.length) console.log(dim("  nobody — nothing can reach this node"));
+      for (const [name, g] of peers) {
+        const repos = (g.repos ?? []).join(", ") || "any repo";
+        console.log(`  ${name.padEnd(28)} ${(g.verbs ?? []).join(", ")}`);
+        console.log(dim(`  ${" ".repeat(28)} ${repos}`));
+      }
+
+      // Handing work over opens a narrow return path automatically: they may
+      // report on that envelope, and nothing else.
+      const open = new Map<string, number>();
+      for (const t of outbox) if (!t.status) open.set(t.to, (open.get(t.to) ?? 0) + 1);
+      console.log(`\n${bold("Reply channels")} ${dim("· open because you handed them work")}`);
+      if (!open.size) console.log(dim("  none outstanding"));
+      for (const [to, n] of open) {
+        console.log(`  ${to.padEnd(28)} ${n} awaiting a report`);
+        console.log(dim(`  ${" ".repeat(28)} may send a status on those only`));
+      }
+
+      console.log(`\n${dim(`policy file: ${paths.policy()}`)}`);
+      console.log(dim("revoke with: bridle revoke <peer>"));
+      return;
+    }
+
+    case "nodes": {
+      const all = localNodes();
+      if (!all.length) { console.log(dim("no nodes on this machine yet")); return; }
+      for (const n of all) {
+        const here = n.home === bridleHome() ? bold(" ← this workspace") : "";
+        console.log(`${n.name.padEnd(24)} ${dim(n.coord ?? "not joined")}${here}`);
+        console.log(dim(`  ${n.home}`));
+      }
+      return;
+    }
+
+    case "policy":
+      console.log(`# ${paths.policy()}`);
+      console.log(readFileSync(paths.policy(), "utf8"));
+      return;
+
+    case "audit": {
+      const { events } = await api.audit();
+      for (const e of events) {
+        console.log(`${dim(String(e.at))}  ${String(e.t).padEnd(18)} ${JSON.stringify(e).slice(0, 120)}`);
+      }
+      return;
+    }
+
+    default:
+      console.log(HELP);
+      if (cmd && cmd !== "help" && cmd !== "--help") process.exitCode = 1;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  try {
+    spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
+  } catch {
+    /* the URL is printed above; opening a browser is a convenience, not a requirement */
+  }
+}
+
+function readConfigName(): string | undefined {
+  try {
+    return readIdentity().name;
+  } catch {
+    return undefined;
+  }
+}
+
+main().catch((err: Error) => {
+  console.error(`\x1b[31merror\x1b[0m ${err.message}`);
+  process.exitCode = 1;
+});

@@ -1,0 +1,35 @@
+# bridle.policy.yaml — an example. `bridle up` writes a real one into ~/.bridle.
+# Deny beats ask beats allow: adding a rule can only ever make things stricter.
+version: 1
+node: ana.dev
+
+defaults:
+  context.push: allow
+  task.queue: allow
+  state.read: allow
+  run.request: ask        # anything that executes stops for a human
+
+limits:
+  payload_bytes: 2097152
+  ask_above_payload_bytes: 262144
+
+# No grant can permit these, ever.
+never:
+  commands:
+    - "git push"
+    - "npm publish"
+    - "vercel deploy"
+    - "rm -rf"
+    - "sudo"
+    - "terraform apply"
+
+# Nothing crosses from a peer that is not listed here.
+peers:
+  marko.dev:
+    key: "MCowBQYDK2VwAyEA..."      # written by `bridle grant`
+    repos: [pai-frontend]
+    verbs: [context.push, task.queue]
+  ci.runner:
+    key: "MCowBQYDK2VwAyEA..."
+    repos: []                        # any repo
+    verbs: [state.read]
