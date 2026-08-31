@@ -22,7 +22,7 @@ async function call<T>(path: string, method = "GET", body?: unknown): Promise<T>
  * `--coord`, and once a node has joined, the coord it joined is remembered in
  * config.json and used from then on regardless of this value.
  */
-export const DEFAULT_COORD = process.env.BRIDLE_COORD ?? "https://bridle-coord-alpha.vercel.app";
+export const DEFAULT_COORD = process.env.BRIDLE_COORD ?? "https://api.bridle.network";
 
 export interface DeviceCode {
   deviceCode: string;

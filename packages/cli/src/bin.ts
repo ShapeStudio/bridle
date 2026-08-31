@@ -54,6 +54,7 @@ ${bold("bridle")} — hand work to a teammate's agent, under their policy.
   bridle pending                               work held for your approval
   bridle approve <id> | bridle deny <id>       the second key
   bridle access                                who you have opened this node to
+  bridle set-coord <url>                       move this node to another coordination server
   bridle nodes                                 every node on this machine
   bridle status | bridle policy | bridle audit
 `;
@@ -360,6 +361,35 @@ async function main(): Promise<void> {
      * receiver, so this is the only place the whole picture exists — the
      * coordination server never sees a policy.
      */
+    /**
+     * Move an already-joined node to a different coordination server.
+     *
+     * A joined node remembers the coord it joined rather than following the
+     * client's default, so upgrading the CLI can never silently relocate
+     * somebody's node. That is the right default and it means moving one is an
+     * explicit act — this is it.
+     */
+    case "set-coord": {
+      const url = positional[0];
+      if (!url) throw new Error("usage: bridle set-coord https://api.bridle.network");
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw new Error(`"${url}" is not a URL`);
+      }
+      if (parsed.protocol !== "https:" && parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost") {
+        throw new Error("refusing a plaintext coordination server — envelopes are sealed, but tokens are not");
+      }
+      const cfg = readConfig();
+      const before = cfg.coord;
+      writeConfig({ ...cfg, coord: parsed.origin });
+      console.log(`${bold(readIdentity().name)} now talks to ${parsed.origin}`);
+      if (before) console.log(dim(`  was ${before}`));
+      console.log(dim("Your token travels with you only if both hostnames are the same server."));
+      return;
+    }
+
     case "access": {
       const policy = readPolicy();
       const identity = readIdentity();

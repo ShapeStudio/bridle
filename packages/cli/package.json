@@ -1,6 +1,6 @@
 {
   "name": "bridle-cli",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -15,7 +15,7 @@
     "bridle": "./dist/src/bin.js"
   },
   "dependencies": {
-    "bridle-core": "^0.1.0"
+    "bridle-core": "^0.1.2"
   },
   "description": "Bridle CLI \u2014 hand work to a teammate's agent, under their policy.",
   "keywords": [
