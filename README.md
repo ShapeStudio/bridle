@@ -124,6 +124,15 @@ entirely by the invite it was given; a node cannot ask for one.
   are sealed to the recipient and policy runs on the receiving machine. A hardened one is
   currently your job or Bridle Cloud's.
 - There is no relay for agents that cannot reach the coordination server directly.
+- **Twice during development a policy file gained an entry that no version of this code can
+  produce** — a node granting itself, and a repo scope appearing when none was passed. Neither
+  reproduced. Self-grants are now refused outright, policy writes are atomic, and every write
+  logs the argv that caused it, so a third occurrence would be attributable. The mechanism is
+  still unknown, and on a tool whose entire job is deciding what is permitted, that is worth
+  saying out loud rather than discovering later.
+- The receive pipeline in `packages/cli/src/actions.ts` has no tests. The 63 cover the parts
+  where being wrong is unrecoverable — envelopes, signatures, sealing, policy, the render
+  fence — and the CLI orchestration around them is currently covered only by use.
 - The MCP server is not shipping in v0. It builds and answers a tools/list handshake, but it
   has no tests and is not part of the supported surface.
 - The Postgres backend has no integration test against a live database — the unit suite covers

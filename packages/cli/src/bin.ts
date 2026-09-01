@@ -167,14 +167,36 @@ async function main(): Promise<void> {
 
       console.log(`\n${bold("Send this to one teammate.")} The invite works once.\n`);
       console.log(dim("────────────────────────────────────────────────────────"));
-      console.log(`You're joining ${bold(readPolicy().node)}'s bridlenet on Bridle.\n`);
+      /**
+       * Addressed to the agent, not the person.
+       *
+       * A teammate who reads this as terminal instructions has missed the
+       * point — it is their *agent* that joins the mesh, and the agent is what
+       * the sender will be handing work to. Saying so in the first line is the
+       * difference between someone opening a terminal and someone pasting this
+       * where it actually belongs.
+       */
+      console.log(bold("Paste this into your coding agent — Claude Code, Codex, Cursor."));
+      console.log(dim("Not into a terminal. The node has to belong to the agent: run it"));
+      console.log(dim("yourself and you join the mesh, but work handed to you arrives"));
+      console.log(dim("with nothing on the other end to pick it up.\n"));
+      console.log(`You're joining ${bold(readPolicy().node)}'s bridlenet on Bridle, so the two of`);
+      console.log(`you can hand work to each other's agents.\n`);
       console.log("1. Install");
       console.log(dim("   npm install -g bridle-cli\n"));
       console.log("2. Join");
       console.log(dim(`   bridle join --coord ${cfg.coord} --invite ${code} --name ${them}\n`));
-      console.log("3. Hand me something");
-      console.log(dim(`   bridle send ${identity.name} --note "..."`));
-      console.log(dim(`   bridle queue ${identity.name} --title "..."\n`));
+      console.log("3. Say hello, so they know you are on");
+      /**
+       * Real strings, not "...".
+       *
+       * Every first contact on a bridlenet arrived as a literal "..." because
+       * that is what this printed and people paste what they are given. A
+       * placeholder that survives copy-paste is not a placeholder.
+       */
+      console.log(dim(`   bridle send ${identity.name} --note "${them} is on the mesh"\n`));
+      console.log("4. Then hand over real work whenever you have some");
+      console.log(dim(`   bridle queue ${identity.name} --title "review the checkout diff"\n`));
       console.log(dim("   `bridle peers` shows who else is on the mesh."));
       console.log(dim("────────────────────────────────────────────────────────"));
       console.log(`\nThen, on your side once they have joined:`);
