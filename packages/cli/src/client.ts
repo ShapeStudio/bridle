@@ -69,7 +69,8 @@ export const api = {
   peers: () => call<{ peers: { name: string; key: string; sealKey: string }[] }>("/v1/peers"),
   send: (envelope: Envelope) => call<{ id: string }>("/v1/envelope", "POST", { envelope }),
   inbox: () => call<{ envelopes: Envelope[] }>("/v1/inbox"),
-  ack: (id: string, verdict: string, reason?: string) =>
-    call<{ ok: true }>("/v1/ack", "POST", { id, verdict, reason }),
+  /** `heldMs` rides along when an operator settled it — how long approval took. Metadata; older servers ignore it. */
+  ack: (id: string, verdict: string, reason?: string, heldMs?: number) =>
+    call<{ ok: true }>("/v1/ack", "POST", { id, verdict, reason, heldMs }),
   audit: () => call<{ events: Record<string, unknown>[] }>("/v1/audit"),
 };

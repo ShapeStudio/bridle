@@ -3,8 +3,9 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { join, resolve, dirname, basename } from "node:path";
 import {
-  generateIdentity, parsePolicy, policyToYaml, DEFAULT_POLICY,
+  generateIdentity, parsePolicy, policyToYaml, DEFAULT_POLICY, parseAuditLine, stampGrantUse,
   type Identity, type Policy, type Envelope, type Decision, type TaskStatus,
+  type AuditEntry, type GrantUsageMap,
 } from "bridle-core";
 
 export interface Config {
@@ -70,6 +71,7 @@ export const paths = {
   delivered: () => p("delivered.jsonl"),
   outbox: () => p("outbox.json"),
   received: () => p("received.json"),
+  grants: () => p("grant-usage.json"),
 };
 
 /** The pre-workspace layout: identity files directly inside ~/.bridle. */
@@ -241,7 +243,30 @@ export function writePending(list: Pending[]): void {
 /** The local half of the audit trail. The coord keeps its own; they should agree. */
 export function recordDelivered(entry: unknown): void {
   const line = JSON.stringify({ at: new Date().toISOString(), ...(entry as object) }) + "\n";
+  appendFileSync(paths.delivered(), line, "utf8");
+}
+
+/**
+ * Reads the local trail back, tolerantly. Lines an older version wrote carry
+ * only `{ at, id, from, verb, verdict }` — they project with the newer fields
+ * simply absent, and a line that does not parse is skipped, not fatal.
+ */
+export function readDelivered(): AuditEntry[] {
   const f = paths.delivered();
-  if (!existsSync(f)) writeFileSync(f, "", "utf8");
-  writeFileSync(f, readFileSync(f, "utf8") + line, "utf8");
+  if (!existsSync(f)) return [];
+  return readFileSync(f, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map(parseAuditLine)
+    .filter((e): e is AuditEntry => e !== null);
+}
+
+/**
+ * Which grants are actually earning their keep. Stamped whenever an inbound
+ * envelope is admitted under one, so `bridle audit --grants` can point at the
+ * standing permissions nobody is spending.
+ */
+export const readGrantUsage = (): GrantUsageMap => readJson(paths.grants(), {});
+export function markGrantUsed(peer: string, at: string = new Date().toISOString()): void {
+  writeFileSync(paths.grants(), JSON.stringify(stampGrantUse(readGrantUsage(), peer, at), null, 2), "utf8");
 }

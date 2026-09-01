@@ -29,6 +29,12 @@ export interface Reason {
 export interface Decision {
   verdict: Verdict;
   reasons: Reason[];
+  /**
+   * The grant this evaluation ran under — the peer name it is filed by.
+   * Absent when no grant was involved: an ungranted stranger, or a reply
+   * admitted on the narrow implied channel.
+   */
+  grant?: string;
   /** The payload as it should actually be handed to the agent. */
   payload: unknown;
   redacted: string[];
@@ -202,7 +208,7 @@ export function evaluate(
   const base = peer.overrides?.[env.verb] ?? policy.defaults[env.verb];
   add("default", `Default for ${env.verb} on this node is ${base}.`, base);
 
-  return { verdict, reasons, payload, redacted: found };
+  return { verdict, reasons, grant: env.from, payload, redacted: found };
 }
 
 export function policyToYaml(policy: Policy): string {

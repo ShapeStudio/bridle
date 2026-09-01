@@ -4,11 +4,11 @@ import { spawn } from "node:child_process";
 import {
   readIdentity, readPolicy, readConfig, writeConfig, up, isUp, readPending, paths,
   bridleHome, workspaceRoot, defaultNodeName, adoptLegacyNode, localNodes,
-  readOutbox, readReceived,
+  readOutbox, readReceived, readDelivered, readGrantUsage,
 } from "./home.js";
 import { api, device, DEFAULT_COORD } from "./client.js";
 import { send, peek, collect, decide, grant, revoke, report, buildContext, fileToAttachment, summarise, fingerprint } from "./actions.js";
-import type { Verb } from "bridle-core";
+import { grantStandings, approvalTimes, type Verb } from "bridle-core";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -25,6 +25,18 @@ const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const tone = (v: string) =>
   v === "allow" ? `\x1b[32m${v}\x1b[0m` : v === "ask" ? `\x1b[33m${v}\x1b[0m` : `\x1b[31m${v}\x1b[0m`;
+
+/** Durations for humans: 90000 → "1m 30s". Audit output, not arithmetic. */
+const fmtMs = (ms: number): string => {
+  if (ms < 1000) return "<1s";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+};
 
 const HELP = `
 ${bold("bridle")} — hand work to a teammate's agent, under their policy.
@@ -51,12 +63,16 @@ ${bold("bridle")} — hand work to a teammate's agent, under their policy.
 
   bridle inbox                                 look at what is waiting, change nothing
   bridle inbox --collect [--deliver]           take delivery: evaluate and acknowledge
-  bridle pending                               work held for your approval
-  bridle approve <id> | bridle deny <id>       the second key
+  bridle pending                               work held for your approval, and for how long
+  bridle approve <id> [--reason "..."]         the second key — the reason lands in the audit trail
+  bridle deny <id> [--reason "..."]
   bridle access                                who you have opened this node to
   bridle set-coord <url>                       move this node to another coordination server
   bridle nodes                                 every node on this machine
-  bridle status | bridle policy | bridle audit
+  bridle audit                                 this node's trail: verdicts, reasons, waits, run outcomes
+  bridle audit --grants                        grant usage — unused grants are there to be revoked
+  bridle audit --coord                         the coordination server's half; the two should agree
+  bridle status | bridle policy
 `;
 
 async function main(): Promise<void> {
@@ -319,7 +335,8 @@ async function main(): Promise<void> {
       const held = readPending();
       if (!held.length) { console.log(dim("nothing held")); return; }
       for (const h of held) {
-        console.log(`${tone("ask").padEnd(16)} ${bold(h.envelope.verb)}  ${dim(h.envelope.id.slice(0, 8))}  from ${h.envelope.from}`);
+        const waiting = h.heldAt ? `  ${dim(`waiting ${fmtMs(Date.now() - Date.parse(h.heldAt))}`)}` : "";
+        console.log(`${tone("ask").padEnd(16)} ${bold(h.envelope.verb)}  ${dim(h.envelope.id.slice(0, 8))}  from ${h.envelope.from}${waiting}`);
         console.log(`  ${summarise(h.envelope)}`);
         for (const r of h.decision.reasons) console.log(dim(`  · ${r.detail}`));
       }
@@ -329,9 +346,11 @@ async function main(): Promise<void> {
     case "approve":
     case "deny": {
       const id = positional[0];
-      if (!id) throw new Error(`usage: bridle ${cmd} <id>`);
-      const r = await decide(id, cmd === "approve" ? "allow" : "deny");
+      if (!id) throw new Error(`usage: bridle ${cmd} <id> [--reason "..."]`);
+      const reason = flag("reason");
+      const r = await decide(id, cmd === "approve" ? "allow" : "deny", reason);
       console.log(`${tone(cmd === "approve" ? "allow" : "deny")} ${r.envelope.verb} from ${r.envelope.from}`);
+      if (reason) console.log(dim(`  reason: ${reason}`));
       if (r.rendered) console.log("\n" + r.rendered + "\n");
       return;
     }
@@ -438,10 +457,69 @@ async function main(): Promise<void> {
       console.log(readFileSync(paths.policy(), "utf8"));
       return;
 
+    /**
+     * The local half of the audit trail: every verdict this node reached, who
+     * waited on whom for how long, and how run.requests came out. `--grants`
+     * turns it around — which standing permissions are earning their keep.
+     * `--coord` fetches the server's half; the two should agree.
+     */
     case "audit": {
-      const { events } = await api.audit();
-      for (const e of events) {
-        console.log(`${dim(String(e.at))}  ${String(e.t).padEnd(18)} ${JSON.stringify(e).slice(0, 120)}`);
+      if (has("coord")) {
+        const { events } = await api.audit();
+        for (const e of events) {
+          console.log(`${dim(String(e.at))}  ${String(e.t).padEnd(18)} ${JSON.stringify(e).slice(0, 120)}`);
+        }
+        return;
+      }
+
+      if (has("grants")) {
+        const standings = grantStandings(readPolicy(), readGrantUsage());
+        if (!standings.length) { console.log(dim("no grants — nothing can reach this node")); return; }
+        console.log(`${bold("Grants")} ${dim("· stamped each time an envelope is admitted under one")}`);
+        for (const s of standings) {
+          const use = s.lastUsedAt ? `used ${s.uses}×, last ${s.lastUsedAt}` : "never used";
+          console.log(`  ${s.peer.padEnd(24)} ${((s.grant.verbs ?? []).join(", ") || "—").padEnd(38)} ${s.unused ? `\x1b[33m${use}\x1b[0m` : dim(use)}`);
+        }
+        const unused = standings.filter((s) => s.unused);
+        if (unused.length) {
+          console.log(`\n${bold("Unused")} ${dim("· standing permissions nobody is spending")}`);
+          for (const s of unused) console.log(dim(`  bridle revoke ${s.peer}`));
+        }
+        return;
+      }
+
+      const entries = readDelivered();
+      if (!entries.length) { console.log(dim("nothing in the local audit trail yet")); return; }
+      for (const e of entries) {
+        const route = e.to ? `${e.from} → ${e.to}` : `from ${e.from}`;
+        console.log(`${dim(e.at)}  ${tone(e.verdict).padEnd(16)} ${bold(e.verb)}  ${dim(e.id.slice(0, 8))}  ${route}`);
+        const detail: string[] = [];
+        if (e.grant) detail.push(`grant ${e.grant}`);
+        if (e.decidedBy === "operator") {
+          detail.push(`${e.verdict === "allow" ? "approved" : "denied"} by operator after ${fmtMs(e.waitedMs ?? 0)}`);
+        } else if (e.verdict === "deny") {
+          const why = e.reasons?.find((r) => r.verdict === "deny");
+          if (why) detail.push(why.detail);
+        } else if (e.verdict === "ask") {
+          detail.push("held for approval");
+        } else if (!e.grant && !e.outcome && e.reasons?.length) {
+          // Allowed with no grant at all — the reply channel. Say so.
+          detail.push(e.reasons[0]!.detail);
+        }
+        if (e.reason) detail.push(`“${e.reason}”`);
+        if (e.outcome) detail.push(`run ${e.outcome} after ${fmtMs(e.runMs ?? 0)}`);
+        if (e.redacted?.length) detail.push(`redacted: ${e.redacted.join(", ")}`);
+        if (detail.length) console.log(dim(`  · ${detail.join("  ·  ")}`));
+      }
+
+      const waits = approvalTimes(entries);
+      const names = Object.keys(waits);
+      if (names.length) {
+        console.log(`\n${bold("Time to approval")} ${dim("· per person kept waiting")}`);
+        for (const name of names) {
+          const w = waits[name]!;
+          console.log(`  ${name.padEnd(24)} ${w.count} decided · mean ${fmtMs(w.meanMs)} · worst ${fmtMs(w.maxMs)}`);
+        }
       }
       return;
     }

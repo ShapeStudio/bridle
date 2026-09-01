@@ -104,7 +104,7 @@ POST /v1/invite          → { code }                       (auth)
 GET  /v1/peers           → { peers: [{ name, key, sealKey }] }
 POST /v1/envelope        { envelope } → 202               (auth)
 GET  /v1/inbox           → { envelopes }                  (auth)
-POST /v1/ack             { id, verdict, reason? }         (auth)
+POST /v1/ack             { id, verdict, reason?, heldMs? }  (auth)
 GET  /v1/audit           → { events }                     (auth)
 GET  /health             → { ok, orgs, nodes }
 ```
@@ -119,3 +119,20 @@ Rules a conforming server must not break:
 - Scope every read to the caller's org. Return the same 404 for a node in another org as for one
   that does not exist — an error must not be usable to probe what lives on the server.
 - An invite decides which org a node joins. There must be no way to name an org directly.
+
+## Audit
+
+Both halves of the trail are **metadata only**: verbs, names, sizes, timestamps, verdicts and
+the reasons behind them. That is the whole budget. A server records what its routing layer
+already sees — an envelope queued, fetched, acked; the verdict and reason the receiving node
+chose to report; `heldMs` when a human's approval settled it. Payload content, sealed or
+opened, must never enter an event. The log stays replayable precisely because it never holds
+anything worth stealing.
+
+The receiving node keeps the richer half locally, because only it can: which grant admitted an
+envelope, how long a held item waited for its operator and why they decided as they did, how a
+`run.request` reported back (passed, failed, reverted) and how long it ran, and when each grant
+last admitted anything — a grant that never does is a standing permission waiting to be revoked.
+On an ack, `verdict` is `allow`, `ask` or `deny`; `reason` is a short code or the operator's own
+words, never payload. Both fields are optional on the wire and a server must tolerate their
+absence — logs written by older nodes still have to replay.

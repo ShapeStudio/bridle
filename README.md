@@ -68,8 +68,11 @@ bridle queue ana.dev --title "retry migration" --repo pai-frontend
 bridle ask   ana.dev --command "pnpm test --filter api"   # stops at her approval
 
 bridle inbox        # verify, open, evaluate
-bridle pending      # what is waiting on you
-bridle approve 81df # the second key
+bridle pending      # what is waiting on you, and for how long
+bridle approve 81df --reason "staging only"   # the second key, on the record
+
+bridle audit          # this node's trail: verdicts, reasons, waits, run outcomes
+bridle audit --grants # which grants are earning their keep — revoke the ones that are not
 ```
 
 An agent drives the same CLI. Anything with a shell — a coding agent, a headless
@@ -100,7 +103,12 @@ Never-rules outrank explicit grants: if `git push` is in `never`, no grant permi
 one you granted a scope to. Otherwise anyone could sign as anyone by bringing their own key.
 
 **Replayable audit.** The coordination server's state *is* an append-only event log; the
-projection is rebuilt from it on boot. Each node keeps its own half. The two should agree.
+projection is rebuilt from it on boot. Each node keeps its own, richer half: every verdict with
+the reasons behind it, which grant admitted what and when each grant last admitted anything
+(`bridle audit --grants` names the ones worth revoking), how long every approval kept the sender
+waiting and what the operator said, and how a `run.request` came out. All of it is metadata —
+verbs, names, sizes, timestamps, verdicts. Payload content never enters either log, so the
+trail can be kept and replayed without weakening the seal on anything it describes.
 
 **Orgs never leak into each other.** Every node, invite, queue and audit entry is keyed by org.
 Node names are unique only *within* an org, so two teams can both have a `marko.dev`. Sending to
@@ -110,9 +118,11 @@ entirely by the invite it was given; a node cannot ask for one.
 
 ### What is not true yet
 
-- There is no open-source coordination server. `docs/PROTOCOL.md` specifies one completely, and
-  the security of the protocol does not rest on it — payloads are sealed to the recipient and
-  policy runs on the receiving machine — but writing one is currently your job or Bridle Cloud's.
+- There is no production open-source coordination server. `docs/PROTOCOL.md` specifies one
+  completely — `npm run demo` spawns a toy server written from that document alone
+  (`scripts/demo-coord.mjs`) — and the security of the protocol does not rest on it: payloads
+  are sealed to the recipient and policy runs on the receiving machine. A hardened one is
+  currently your job or Bridle Cloud's.
 - There is no relay for agents that cannot reach the coordination server directly.
 - The MCP server is not shipping in v0. It builds and answers a tools/list handshake, but it
   has no tests and is not part of the supported surface.

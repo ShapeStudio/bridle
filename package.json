@@ -14,7 +14,8 @@
   "scripts": {
     "build": "tsc --build",
     "clean": "tsc --build --clean",
-    "test": "npm run build && node --test packages/*/dist/test/*.test.js"
+    "test": "npm run build && node --test packages/*/dist/test/*.test.js",
+    "demo": "node scripts/demo.mjs"
   },
   "devDependencies": {
     "@types/node": "^24",

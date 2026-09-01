@@ -5,7 +5,10 @@ import {
   generateIdentity, signEnvelope, verifyEnvelope, verifyFrom, fingerprint,
   parsePolicy, evaluate, DEFAULT_POLICY, policyToYaml,
   redactDeep, renderForAgent, sealEnvelope, openEnvelope,
-  type Envelope, type Policy,
+  auditPolicyDecision, auditOperatorDecision, auditRunOutcome, timeToApproval,
+  runOutcomeFromStatus, approvalTimes, parseAuditLine,
+  stampGrantUse, grantStandings, unusedGrants,
+  type Envelope, type Policy, type AuditEntry,
 } from "../src/index.js";
 
 const marko = generateIdentity("marko.dev");
@@ -391,5 +394,176 @@ describe("reporting back on handed-off work", () => {
     assert.ok(verifyEnvelope(sealed));
     // and tampering with it breaks the signature
     assert.equal(verifyEnvelope({ ...sealed, ref: "def-456" }), false);
+  });
+});
+
+describe("the audit trail", () => {
+  test("evaluate names the grant it ran under", () => {
+    assert.equal(evaluate(signEnvelope(env(), marko), grantedContext).grant, "marko.dev");
+    assert.equal(evaluate(signEnvelope(env(), marko), policyFor("peers: {}")).grant, undefined);
+  });
+
+  test("a reply admitted on the implied channel used no grant, and says so", () => {
+    const reply = signEnvelope(
+      env({ from: "ana.dev", fromKey: ana.publicKey, to: "marko.dev", ref: "x", payload: { status: "done" } }),
+      ana
+    );
+    const d = evaluate(reply, policyFor("peers: {}"), { signatureOk: true, impliedReply: true });
+    assert.equal(d.verdict, "allow");
+    assert.equal(d.grant, undefined);
+  });
+
+  test("an entry captures verb, parties, grant, verdict and the reasons behind it", () => {
+    const e = signEnvelope(env(), marko);
+    const a = auditPolicyDecision(e, evaluate(e, grantedContext), { at: "2026-08-28T09:00:01.000Z" });
+    assert.equal(a.verb, "context.push");
+    assert.equal(a.from, "marko.dev");
+    assert.equal(a.to, "ana.dev");
+    assert.equal(a.repo, "pai-frontend");
+    assert.equal(a.verdict, "allow");
+    assert.equal(a.grant, "marko.dev");
+    assert.equal(a.decidedBy, "policy");
+    assert.ok((a.bytes ?? 0) > 0, "size is metadata the relay sees anyway");
+    assert.ok(a.reasons?.some((r) => r.code === "default"));
+  });
+
+  test("a denial records the rule that refused it", () => {
+    const e = signEnvelope(env(), marko);
+    const a = auditPolicyDecision(e, evaluate(e, policyFor("peers: {}")));
+    assert.equal(a.verdict, "deny");
+    assert.equal(a.grant, undefined);
+    assert.ok(a.reasons?.some((r) => r.code === "no-bridle"));
+  });
+
+  // The load-bearing property: the trail may describe an envelope, never quote it.
+  test("an entry never contains payload content", () => {
+    const noted = signEnvelope(env({ payload: { note: "the staging password rotation plan" } }), marko);
+    const a = auditPolicyDecision(noted, evaluate(noted, grantedContext));
+    assert.doesNotMatch(JSON.stringify(a), /password rotation/);
+
+    const runPolicy = policyFor(
+      `peers:\n  marko.dev:\n    key: "${marko.publicKey}"\n    repos: [pai-frontend]\n    verbs: [run.request]\n`
+    );
+    const run = signEnvelope(env({ verb: "run.request", payload: { command: "git push origin main" } }), marko);
+    const b = auditPolicyDecision(run, evaluate(run, runPolicy));
+    // "git push" may appear — it is the never-rule, policy config. The command may not.
+    assert.doesNotMatch(JSON.stringify(b), /origin main/);
+  });
+
+  test("a held envelope records when the hold began", () => {
+    const e = signEnvelope(env({ payload: { note: "token ghp_abcdefghijklmnopqrstuvwxyz0123" } }), marko);
+    const d = evaluate(e, grantedContext);
+    const a = auditPolicyDecision(e, d, { at: "2026-08-28T09:00:05.000Z", heldAt: "2026-08-28T09:00:05.000Z" });
+    assert.equal(a.verdict, "ask");
+    assert.equal(a.heldAt, "2026-08-28T09:00:05.000Z");
+    assert.deepEqual(a.redacted, ["github-token"], "names the secret's type, never its value");
+  });
+
+  test("an operator decision records the reason and the wait", () => {
+    const a = auditOperatorDecision(env(), "allow", {
+      heldAt: "2026-08-28T09:00:00.000Z",
+      at: "2026-08-28T09:01:30.000Z",
+      reason: "safe in staging",
+      grant: "marko.dev",
+    });
+    assert.equal(a.decidedBy, "operator");
+    assert.equal(a.verdict, "allow");
+    assert.equal(a.waitedMs, 90_000);
+    assert.equal(a.reason, "safe in staging");
+    assert.equal(a.grant, "marko.dev");
+  });
+
+  test("time to approval can never be negative", () => {
+    assert.equal(timeToApproval("2026-08-28T09:05:00.000Z", "2026-08-28T09:00:00.000Z"), 0);
+    assert.equal(timeToApproval("2026-08-28T09:00:00.000Z", "2026-08-28T09:00:42.000Z"), 42_000);
+  });
+
+  test("approval times aggregate per person kept waiting", () => {
+    const op = (from: string, waitedMs: number): AuditEntry => ({
+      at: "2026-08-28T10:00:00.000Z", id: "x", verb: "run.request", from,
+      verdict: "allow", decidedBy: "operator", waitedMs,
+    });
+    const policyOnly: AuditEntry = {
+      at: "2026-08-28T10:00:00.000Z", id: "y", verb: "context.push", from: "marko.dev", verdict: "allow",
+    };
+    const t = approvalTimes([op("marko.dev", 60_000), op("marko.dev", 120_000), op("luka.dev", 30_000), policyOnly]);
+    assert.deepEqual(t["marko.dev"], { count: 2, meanMs: 90_000, maxMs: 120_000 });
+    assert.deepEqual(t["luka.dev"], { count: 1, meanMs: 30_000, maxMs: 30_000 });
+  });
+
+  test("a status report is the only window onto a run's outcome", () => {
+    assert.equal(runOutcomeFromStatus("done"), "passed");
+    assert.equal(runOutcomeFromStatus("blocked"), "failed");
+    assert.equal(runOutcomeFromStatus("working"), undefined);
+
+    const a = auditRunOutcome({
+      id: "run-1", from: "marko.dev", to: "ana.dev", status: "done",
+      startedAt: "2026-08-28T09:00:00.000Z", reportedAt: "2026-08-28T09:05:00.000Z",
+    });
+    assert.equal(a?.outcome, "passed");
+    assert.equal(a?.runMs, 300_000);
+    assert.equal(a?.verb, "run.request");
+
+    const inFlight = auditRunOutcome({
+      id: "run-2", from: "marko.dev", to: "ana.dev", status: "working",
+      startedAt: "2026-08-28T09:00:00.000Z", reportedAt: "2026-08-28T09:01:00.000Z",
+    });
+    assert.equal(inFlight, undefined, "nothing final to record yet");
+  });
+
+  // Logs written before any of this existed must project untouched.
+  test("an old audit line still parses, the new fields simply absent", () => {
+    const a = parseAuditLine(
+      '{"at":"2026-08-28T12:49:44.000Z","id":"e65880e9","from":"marko.dev","verb":"context.push","verdict":"allow"}'
+    );
+    assert.equal(a?.verdict, "allow");
+    assert.equal(a?.grant, undefined);
+    assert.equal(a?.waitedMs, undefined);
+    assert.equal(a?.outcome, undefined);
+  });
+
+  test("a line that is not an entry is skipped, not fatal", () => {
+    assert.equal(parseAuditLine("not json at all"), null);
+    assert.equal(parseAuditLine('{"random":true}'), null);
+  });
+});
+
+describe("grant usage", () => {
+  test("an admitted envelope stamps the grant it came in under", () => {
+    let u = stampGrantUse({}, "marko.dev", "2026-08-28T09:00:00.000Z");
+    assert.deepEqual(u["marko.dev"], { lastUsedAt: "2026-08-28T09:00:00.000Z", uses: 1 });
+    u = stampGrantUse(u, "marko.dev", "2026-08-28T10:00:00.000Z");
+    assert.deepEqual(u["marko.dev"], { lastUsedAt: "2026-08-28T10:00:00.000Z", uses: 2 });
+  });
+
+  test("an out-of-order stamp counts, but cannot move last-used backwards", () => {
+    let u = stampGrantUse({}, "marko.dev", "2026-08-28T10:00:00.000Z");
+    u = stampGrantUse(u, "marko.dev", "2026-08-28T09:00:00.000Z");
+    assert.equal(u["marko.dev"]?.lastUsedAt, "2026-08-28T10:00:00.000Z");
+    assert.equal(u["marko.dev"]?.uses, 2);
+  });
+
+  test("grants nothing has come in under are listed for pruning", () => {
+    const policy = policyFor(
+      `peers:\n  marko.dev:\n    key: "k1"\n    verbs: [context.push]\n  luka.dev:\n    key: "k2"\n    verbs: [task.queue]\n`
+    );
+    const usage = stampGrantUse({}, "marko.dev", "2026-08-28T09:00:00.000Z");
+    const standings = grantStandings(policy, usage);
+    assert.equal(standings.length, 2);
+    assert.equal(standings.find((s) => s.peer === "marko.dev")?.unused, false);
+    const prune = unusedGrants(policy, usage);
+    assert.deepEqual(prune.map((s) => s.peer), ["luka.dev"]);
+    assert.equal(prune[0]?.uses, 0);
+  });
+
+  test("a grant idle past the horizon counts as unused too", () => {
+    const policy = policyFor(`peers:\n  marko.dev:\n    key: "k1"\n    verbs: [context.push]\n`);
+    const usage = stampGrantUse({}, "marko.dev", "2026-07-01T00:00:00.000Z");
+    const month = 30 * 24 * 60 * 60 * 1000;
+    assert.equal(unusedGrants(policy, usage, { asOf: "2026-07-15T00:00:00.000Z", unusedAfterMs: month }).length, 0);
+    assert.deepEqual(
+      unusedGrants(policy, usage, { asOf: "2026-08-28T00:00:00.000Z", unusedAfterMs: month }).map((s) => s.peer),
+      ["marko.dev"]
+    );
   });
 });
