@@ -1,0 +1,70 @@
+# Is Bridle actually up?
+#
+# Lives in the public repo on purpose: Actions minutes are free and unlimited
+# here, and every check hits a public URL, so this workflow needs no secrets.
+# A failed run emails whoever is watching the repo, which is the whole alerting
+# mechanism — deliberately, because a monitor with its own dashboard is a second
+# thing that can be down.
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: coordination server answers, and can reach its database
+        run: |
+          # /health counts rows, so a 200 here proves the Postgres path too —
+          # not just that a function booted.
+          body=$(curl -sS --max-time 20 --retry 2 --retry-delay 5 https://api.bridle.network/health)
+          echo "health: $body"
+          echo "$body" | grep -q '"ok":true' || { echo "::error::/health did not report ok"; exit 1; }
+          echo "$body" | grep -qE '"nodes":[0-9]+' || { echo "::error::/health returned no node count — database unreachable?"; exit 1; }
+
+      - name: relay refuses an unsigned envelope
+        run: |
+          # A 4xx is the correct answer. A 5xx means the server is broken rather
+          # than strict, and a 2xx would mean it stopped checking.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            -X POST https://api.bridle.network/v1/envelope \
+            -H 'content-type: application/json' -d '{"envelope":{"v":1}}')
+          echo "unsigned envelope -> $code"
+          case "$code" in
+            4*) : ;;
+            *) echo "::error::expected a 4xx for an unauthenticated envelope, got $code"; exit 1 ;;
+          esac
+
+      - name: dashboard serves sign-in
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 https://app.bridle.network/login)
+          echo "dashboard: $code"
+          [ "$code" = "200" ] || { echo "::error::dashboard /login returned $code"; exit 1; }
+
+      - name: site is served
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 -L https://bridle.network/)
+          echo "site: $code"
+          [ "$code" = "200" ] || { echo "::error::bridle.network returned $code"; exit 1; }
+
+      - name: the install everyone is told to run still resolves
+        run: |
+          # The README and every post say `npm install -g bridle-cli`. If that
+          # stops resolving, the front door is shut regardless of uptime.
+          ver=$(npm view bridle-cli version 2>/dev/null)
+          echo "bridle-cli on npm: ${ver:-<none>}"
+          [ -n "$ver" ] || { echo "::error::bridle-cli is not resolvable on npm"; exit 1; }
+
+      - name: certificates are not about to expire
+        run: |
+          for host in api.bridle.network app.bridle.network bridle.network; do
+            end=$(echo | openssl s_client -servername "$host" -connect "$host":443 2>/dev/null \
+                  | openssl x509 -noout -enddate | cut -d= -f2)
+            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            echo "$host: $days days left"
+            [ "$days" -gt 7 ] || { echo "::error::$host certificate expires in $days days"; exit 1; }
+          done
